@@ -2,17 +2,18 @@ import {
   WebSocketGateway,
   WebSocketServer,
   SubscribeMessage,
+  ConnectedSocket,
+  MessageBody,
   OnGatewayConnection,
   OnGatewayDisconnect,
-  MessageBody,
-  ConnectedSocket,
 } from '@nestjs/websockets';
-import { Server, Socket } from 'socket.io';
 import { Logger, UseGuards } from '@nestjs/common';
+import { Server, Socket } from 'socket.io';
 import * as Y from 'yjs';
 import { WsAuthGuard } from '../auth/ws-auth.guard';
 import { WsUser } from '../decorators/ws-user.decorator';
-import { UserAuth } from '../types/userAuth.type';
+import type { UserAuth } from '../types/userAuth.type';
+
 @UseGuards(WsAuthGuard) // 인증 가드 적용
 @WebSocketGateway({
   cors: {
@@ -22,352 +23,157 @@ import { UserAuth } from '../types/userAuth.type';
   pingTimeout: 60000, // 60초
   pingInterval: 25000, // 25초
 })
-export class CollaborationGateway
-  implements OnGatewayConnection, OnGatewayDisconnect
-{
+export class CollaborationGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
 
   private readonly logger = new Logger(CollaborationGateway.name);
-  private documentMap = new Map<string, Y.Doc>(); // documentId -> Y.Doc
+  private documentMap = new Map<string, Y.Doc>(); // cardsetId -> Y.Doc
 
   constructor() {}
 
   handleConnection(client: Socket) {
     this.logger.log(`Client connected: ${client.id}`);
-    // Socket.IO의 내장 PING/PONG 하트비트가 자동으로 처리됩니다
   }
 
   handleDisconnect(client: Socket) {
     this.logger.log(`Client disconnected: ${client.id}`);
-    this.logger.log(
-      `Disconnect reason: ${client.disconnected ? 'Client initiated' : 'Server initiated'}`,
-    );
-    // Socket.IO의 내장 하트비트가 자동으로 연결 상태를 관리합니다
+    // 클라이언트가 연결된 모든 카드셋에서 나가기
+    for (const [cardsetId, doc] of this.documentMap) {
+      void client.leave(`cardset:${cardsetId}`);
+    }
   }
 
-  @SubscribeMessage('joinRoom')
-  handleJoinDocument(
+  // 카드셋에 조인 (카드셋의 Yjs 문서에 접근)
+  @SubscribeMessage('join-cardset')
+  async handleJoinCardset(
+    @WsUser() user: UserAuth,
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { documentId: string; userId?: string },
+    @MessageBody() data: { cardsetId: string },
   ) {
     try {
-      this.logger.log(
-        `Client ${client.id} joining document: ${data.documentId}`,
-      );
+      const { cardsetId } = data;
+      this.logger.log(`User ${user.userId} joining cardset ${cardsetId}`);
 
-      // 클라이언트를 룸에 조인
-      void client.join(data.documentId);
+      // 카드셋 룸에 조인
+      void client.join(`cardset:${cardsetId}`);
 
-      // Yjs 문서 초기화 또는 가져오기
-      let doc = this.documentMap.get(data.documentId);
+      // 카드셋의 Yjs 문서 가져오기 또는 생성
+      let doc = this.documentMap.get(cardsetId);
       if (!doc) {
         doc = new Y.Doc();
-        this.documentMap.set(data.documentId, doc);
+        this.documentMap.set(cardsetId, doc);
+        this.logger.log(`Created new Yjs document for cardset ${cardsetId}`);
       }
 
-      // 클라이언트에게 현재 문서 상태 전송
-      const state = Y.encodeStateAsUpdate(doc);
-      client.emit('sync', {
-        documentId: data.documentId,
-        update: Array.from(state),
+      // 클라이언트에게 현재 카드셋 상태 전송
+      const cards = doc.getArray('cards');
+      client.emit('cardset-state', {
+        cardsetId,
+        cards: cards.toArray(),
       });
 
-      // 조인 성공 응답
-      client.emit('joinRoom', {
-        documentId: data.documentId,
-        clientId: client.id,
-        timestamp: new Date().toISOString(),
-      });
-
-      // 다른 클라이언트들에게 새 클라이언트 알림
-      client.to(data.documentId).emit('user-joined', {
-        clientId: client.id,
-        userId: data.userId,
-        timestamp: new Date().toISOString(),
-      });
+      this.logger.log(`User ${user.userId} joined cardset ${cardsetId}`);
     } catch (error) {
-      this.logger.error(
-        `Error joining document: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-      client.emit('error', { message: 'Failed to join document' });
+      this.logger.error('Error joining cardset:', error);
+      client.emit('error', { message: 'Failed to join cardset' });
     }
   }
 
-  @SubscribeMessage('leaveRoom')
-  handleLeaveDocument(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { documentId: string },
-  ) {
-    try {
-      this.logger.log(
-        `Client ${client.id} leaving document: ${data.documentId}`,
-      );
-
-      // YJS 서비스 제거로 인한 간단한 처리
-
-      // 룸에서 나가기
-      void client.leave(data.documentId);
-
-      // 나가기 성공 응답
-      client.emit('userLeft', {
-        documentId: data.documentId,
-        clientId: client.id,
-        timestamp: new Date().toISOString(),
-      });
-
-      // 다른 클라이언트들에게 클라이언트 나감 알림
-      client.to(data.documentId).emit('userLeft', {
-        clientId: client.id,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error) {
-      this.logger.error(
-        `Error leaving document: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-      client.emit('error', { message: 'Failed to leave document' });
-    }
-  }
-
-  @SubscribeMessage('sendMessage')
-  handleTextUpdate(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { documentId: string; field: string; content: string },
-  ) {
-    try {
-      this.logger.log(
-        `Received text update from client ${client.id} for document ${data.documentId} (${data.field})`,
-      );
-
-      // 텍스트 업데이트를 다른 클라이언트들에게 브로드캐스트
-      client.to(data.documentId).emit('text-update', {
-        documentId: data.documentId,
-        field: data.field,
-        content: data.content,
-        fromClientId: client.id,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error) {
-      this.logger.error(
-        `Error broadcasting text update: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-    }
-  }
-
-  @SubscribeMessage('sync')
-  handleSync(
+  // 카드셋에서 나가기
+  @SubscribeMessage('leave-cardset')
+  async handleLeaveCardset(
     @WsUser() user: UserAuth,
     @ConnectedSocket() client: Socket,
-    @MessageBody()
-    data: { documentId: string; syncStep: number; update?: number[] },
+    @MessageBody() data: { cardsetId: string },
   ) {
     try {
-      this.logger.log(
-        `Received sync from client ${client.id} (user: ${user.userId}) for document ${data.documentId}`,
-      );
+      const { cardsetId } = data;
+      this.logger.log(`User ${user.userId} leaving cardset ${cardsetId}`);
 
-      const doc = this.documentMap.get(data.documentId);
+      void client.leave(`cardset:${cardsetId}`);
+      this.logger.log(`User ${user.userId} left cardset ${cardsetId}`);
+    } catch (error) {
+      this.logger.error('Error leaving cardset:', error);
+    }
+  }
 
+
+  // 카드 업데이트
+  @SubscribeMessage('update-card')
+  async handleUpdateCard(
+    @WsUser() user: UserAuth,
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { cardsetId: string; cardId: string; updates: Partial<{ content: string; order: number }> },
+  ) {
+    try {
+      const { cardsetId, cardId, updates } = data;
+      this.logger.log(`User ${user.userId} updating card ${cardId} in cardset ${cardsetId}`);
+
+      const doc = this.documentMap.get(cardsetId);
       if (!doc) {
-        this.logger.warn(
-          `Document not found: ${data.documentId} for client ${client.id}`,
-        );
-        client.emit('error', { message: 'Document not found' });
+        client.emit('error', { message: 'Cardset not found' });
         return;
       }
 
-      this.handleSyncMessage(client, doc, data.documentId, data);
-    } catch (error) {
-      this.logger.error(
-        `Error processing sync from client ${client.id}: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-    }
-  }
-
-  @SubscribeMessage('update')
-  handleUpdate(
-    @WsUser() user: UserAuth,
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { documentId: string; update: number[] },
-  ) {
-    try {
-      this.logger.log(
-        `Received update from client ${client.id} (user: ${user.userId}) for document ${data.documentId}`,
-      );
-
-      const doc = this.documentMap.get(data.documentId);
-
-      if (!doc) {
-        this.logger.warn(
-          `Document not found: ${data.documentId} for client ${client.id}`,
-        );
-        client.emit('error', { message: 'Document not found' });
+      const cards = doc.getArray('cards');
+      const cardsArray = cards.toArray();
+      const cardIndex = cardsArray.findIndex((card: any) => card.id === cardId);
+      
+      if (cardIndex === -1) {
+        client.emit('error', { message: 'Card not found' });
         return;
       }
 
-      this.handleUpdateMessage(client, doc, data.documentId, data);
-    } catch (error) {
-      this.logger.error(
-        `Error processing update from client ${client.id}: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-    }
-  }
-
-  @SubscribeMessage('awareness')
-  handleAwareness(
-    @WsUser() user: UserAuth,
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { documentId: string; awareness: number[] },
-  ) {
-    try {
-      this.logger.log(
-        `Received awareness from client ${client.id} (user: ${user.userId}) for document ${data.documentId}`,
-      );
-
-      const doc = this.documentMap.get(data.documentId);
-
-      if (!doc) {
-        this.logger.warn(
-          `Document not found: ${data.documentId} for client ${client.id}`,
-        );
-        client.emit('error', { message: 'Document not found' });
-        return;
-      }
-
-      this.handleAwarenessMessage(client, doc, data.documentId, data);
-    } catch (error) {
-      this.logger.error(
-        `Error processing awareness from client ${client.id}: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-    }
-  }
-
-  @SubscribeMessage('auth')
-  handleAuthMessage(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { token: string; userId: string; documentId: string },
-  ) {
-    try {
-      this.logger.log(
-        `Received auth from client ${client.id}, userId: ${data.userId}, documentId: ${data.documentId}`,
-      );
-
-      this.handleAuth(client, data);
-    } catch (error) {
-      this.logger.error(
-        `Error processing auth from client ${client.id}: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-    }
-  }
-
-  private handleSyncMessage(
-    client: Socket,
-    doc: Y.Doc,
-    documentId: string,
-    data: any,
-  ) {
-    const { syncStep, update } = data as {
-      syncStep: number;
-      update?: number[];
-    };
-
-    if (syncStep === 0) {
-      // Step 0: 클라이언트가 현재 상태 벡터 전송
-      const stateVector = Y.encodeStateVector(doc);
-      client.emit('sync', {
-        syncStep: 1,
-        update: Array.from(stateVector),
-      });
-    } else if (syncStep === 1 && update) {
-      // Step 1: 서버가 차이점 전송
-      const diff = Y.encodeStateAsUpdate(
-        doc,
-        new Uint8Array(update as unknown as ArrayBufferLike),
-      );
-      client.emit('sync', {
-        syncStep: 1,
-        update: Array.from(diff),
-      });
-    }
-  }
-
-  private handleUpdateMessage(
-    client: Socket,
-    doc: Y.Doc,
-    documentId: string,
-    data: any,
-  ) {
-    const { update } = data as { update: number[] };
-    Y.applyUpdate(doc, new Uint8Array(update as unknown as ArrayBufferLike));
-
-    // 다른 클라이언트들에게 sync 메시지로 브로드캐스트
-    client.to(documentId).emit('sync', {
-      syncStep: 1,
-      update: Array.from(update),
-    });
-  }
-
-  private handleAwarenessMessage(
-    client: Socket,
-    doc: Y.Doc,
-    documentId: string,
-    data: any,
-  ) {
-    const { awareness } = data as { awareness: number[] };
-
-    // 다른 클라이언트들에게 awareness 브로드캐스트
-    client.to(documentId).emit('awareness', {
-      awareness: Array.from(awareness),
-    });
-  }
-
-  private handleAuth(
-    client: Socket,
-    data: { token: string; userId: string; documentId: string },
-  ) {
-    try {
-      this.logger.log(
-        `Received auth from client ${client.id}, userId: ${data.userId}, documentId: ${data.documentId}`,
-      );
-      this.logger.log(`Auth data: ${JSON.stringify(data)}`);
-
-      // TODO: 실제 JWT 토큰 검증 로직 구현
-      // 임시로 토큰이 있으면 인증 성공으로 처리
-      const hasAccess = true;
-
-      const accessControlMessage = {
-        data: {
-          hasAccess,
-          message: hasAccess
-            ? 'Authentication successful'
-            : 'Authentication failed',
-        },
-        clientId: client.id,
-        timestamp: new Date().toISOString(),
+      const currentCard = cardsArray[cardIndex] as any;
+      const updatedCard = {
+        ...currentCard,
+        ...updates,
+        updatedAt: new Date().toISOString(),
       };
 
-      this.logger.log(
-        `Sending access-control to client ${client.id}: ${JSON.stringify(accessControlMessage)}`,
-      );
-      client.emit('access-control', accessControlMessage);
+      cards.delete(cardIndex, 1);
+      cards.insert(cardIndex, [updatedCard]);
 
-      // 클라이언트가 이벤트를 받을 시간을 주기 위해 약간의 지연
-      setTimeout(() => {
-        this.logger.log(`Auth result for client ${client.id}: ${hasAccess}`);
-      }, 100);
+      this.logger.log(`Card ${cardId} updated in cardset ${cardsetId}`);
     } catch (error) {
-      this.logger.error(
-        `Auth error: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-      this.logger.error(`Auth data: ${JSON.stringify(data)}`);
-      client.emit('access-control', {
-        data: {
-          hasAccess: false,
-          message: 'Authentication error',
-        },
-        clientId: client.id,
-        timestamp: new Date().toISOString(),
+      this.logger.error('Error updating card:', error);
+      client.emit('error', { message: 'Failed to update card' });
+    }
+  }
+
+
+  // Yjs 동기화 (클라이언트가 변경사항을 받을 때)
+  @SubscribeMessage('sync')
+  async handleSync(
+    @WsUser() user: UserAuth,
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { cardsetId: string; syncStep: number; update?: number[] },
+  ) {
+    try {
+      const { cardsetId, syncStep, update } = data;
+      this.logger.log(`Sync request from user ${user.userId} for cardset ${cardsetId}`);
+
+      const doc = this.documentMap.get(cardsetId);
+      if (!doc) {
+        client.emit('error', { message: 'Cardset not found' });
+        return;
+      }
+
+      if (update) {
+        // 클라이언트에서 온 업데이트 적용
+        Y.applyUpdate(doc, new Uint8Array(update));
+      }
+
+      // 현재 상태를 클라이언트에게 전송
+      const state = Y.encodeStateAsUpdate(doc);
+      client.emit('sync-response', {
+        cardsetId,
+        update: Array.from(state),
       });
+    } catch (error) {
+      this.logger.error('Error during sync:', error);
+      client.emit('error', { message: 'Sync failed' });
     }
   }
 }
