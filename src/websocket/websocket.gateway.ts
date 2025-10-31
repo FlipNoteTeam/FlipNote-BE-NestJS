@@ -100,7 +100,7 @@ export class CollaborationGateway implements OnGatewayConnection, OnGatewayDisco
 
 
   // 카드 업데이트
-  @SubscribeMessage('update-card')
+  @SubscribeMessage('update')
   async handleUpdateCard(
     @WsUser() user: UserAuth,
     @ConnectedSocket() client: Socket,
@@ -135,7 +135,14 @@ export class CollaborationGateway implements OnGatewayConnection, OnGatewayDisco
       cards.delete(cardIndex, 1);
       cards.insert(cardIndex, [updatedCard]);
 
-      this.logger.log(`Card ${cardId} updated in cardset ${cardsetId}`);
+      // 업데이트 후 모든 클라이언트에게 sync 브로드캐스트
+      const state = Y.encodeStateAsUpdate(doc);
+      this.server.to(`cardset:${cardsetId}`).emit('sync', {
+        cardsetId,
+        update: Array.from(state),
+      });
+
+      this.logger.log(`Card ${cardId} updated in cardset ${cardsetId} and sync broadcasted`);
     } catch (error) {
       this.logger.error('Error updating card:', error);
       client.emit('error', { message: 'Failed to update card' });
@@ -163,14 +170,22 @@ export class CollaborationGateway implements OnGatewayConnection, OnGatewayDisco
       if (update) {
         // 클라이언트에서 온 업데이트 적용
         Y.applyUpdate(doc, new Uint8Array(update));
+        
+        // 업데이트 적용 후 모든 클라이언트에게 sync 브로드캐스트
+        const state = Y.encodeStateAsUpdate(doc);
+        this.server.to(`cardset:${cardsetId}`).emit('sync', {
+          cardsetId,
+          update: Array.from(state),
+        });
+        this.logger.log(`Sync update from user ${user.userId} broadcasted to all clients in cardset ${cardsetId}`);
+      } else {
+        // 업데이트가 없으면 현재 상태를 요청한 클라이언트에게만 전송
+        const state = Y.encodeStateAsUpdate(doc);
+        client.emit('sync', {
+          cardsetId,
+          update: Array.from(state),
+        });
       }
-
-      // 현재 상태를 클라이언트에게 전송
-      const state = Y.encodeStateAsUpdate(doc);
-      client.emit('sync', {
-        cardsetId,
-        update: Array.from(state),
-      });
     } catch (error) {
       this.logger.error('Error during sync:', error);
       client.emit('error', { message: 'Sync failed' });
