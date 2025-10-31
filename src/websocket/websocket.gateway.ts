@@ -167,7 +167,7 @@ export class CollaborationGateway implements OnGatewayConnection, OnGatewayDisco
 
       // 현재 상태를 클라이언트에게 전송
       const state = Y.encodeStateAsUpdate(doc);
-      client.emit('sync-response', {
+      client.emit('sync', {
         cardsetId,
         update: Array.from(state),
       });
