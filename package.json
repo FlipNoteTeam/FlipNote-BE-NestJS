@@ -17,7 +17,8 @@
     "test:watch": "jest --watch --passWithNoTests",
     "test:cov": "jest --coverage --passWithNoTests",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand --passWithNoTests",
-    "test:e2e": "jest --passWithNoTests --config ./test/jest-e2e.json"
+    "test:e2e": "jest --passWithNoTests --config ./test/jest-e2e.json",
+    "test:redis": "ts-node -r tsconfig-paths/register test-redis.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.1",
@@ -29,6 +30,7 @@
     "@nestjs/swagger": "^11.2.0",
     "@nestjs/typeorm": "^11.0.0",
     "@nestjs/websockets": "^11.1.6",
+    "ioredis": "^5.8.2",
     "jsonwebtoken": "^9.0.2",
     "mysql2": "^3.14.4",
     "reflect-metadata": "^0.2.2",
@@ -52,6 +54,7 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.10.7",
     "@types/supertest": "^6.0.2",
+    "dotenv": "^17.2.3",
     "eslint": "^9.18.0",
     "eslint-config-prettier": "^10.0.1",
     "eslint-plugin-prettier": "^5.2.2",
