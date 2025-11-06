@@ -23,7 +23,9 @@ import type { UserAuth } from '../types/userAuth.type';
   pingTimeout: 60000, // 60초
   pingInterval: 25000, // 25초
 })
-export class CollaborationGateway implements OnGatewayConnection, OnGatewayDisconnect {
+export class CollaborationGateway
+  implements OnGatewayConnection, OnGatewayDisconnect
+{
   @WebSocketServer()
   server: Server;
 
@@ -39,7 +41,7 @@ export class CollaborationGateway implements OnGatewayConnection, OnGatewayDisco
   handleDisconnect(client: Socket) {
     this.logger.log(`Client disconnected: ${client.id}`);
     // 클라이언트가 연결된 모든 카드셋에서 나가기
-    for (const [cardsetId, doc] of this.documentMap) {
+    for (const [cardsetId] of this.documentMap) {
       void client.leave(`cardset:${cardsetId}`);
     }
   }
@@ -67,10 +69,11 @@ export class CollaborationGateway implements OnGatewayConnection, OnGatewayDisco
       }
 
       // 클라이언트에게 현재 카드셋 상태 전송
-      const cards = doc.getArray('cards');
-      client.emit('cardset-state', {
+      const state = Y.encodeStateAsUpdate(doc);
+
+      client.emit('sync', {
         cardsetId,
-        cards: cards.toArray(),
+        update: Array.from(state),
       });
 
       this.logger.log(`User ${user.userId} joined cardset ${cardsetId}`);
@@ -98,68 +101,18 @@ export class CollaborationGateway implements OnGatewayConnection, OnGatewayDisco
     }
   }
 
-
-  // 카드 업데이트
+  // Yjs 업데이트 (클라이언트가 변경사항을 받을 때)
   @SubscribeMessage('update')
-  async handleUpdateCard(
-    @WsUser() user: UserAuth,
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { cardsetId: string; cardId: string; updates: Partial<{ content: string; order: number }> },
-  ) {
-    try {
-      const { cardsetId, cardId, updates } = data;
-      this.logger.log(`User ${user.userId} updating card ${cardId} in cardset ${cardsetId}`);
-
-      const doc = this.documentMap.get(cardsetId);
-      if (!doc) {
-        client.emit('error', { message: 'Cardset not found' });
-        return;
-      }
-
-      const cards = doc.getArray('cards');
-      const cardsArray = cards.toArray();
-      const cardIndex = cardsArray.findIndex((card: any) => card.id === cardId);
-      
-      if (cardIndex === -1) {
-        client.emit('error', { message: 'Card not found' });
-        return;
-      }
-
-      const currentCard = cardsArray[cardIndex] as any;
-      const updatedCard = {
-        ...currentCard,
-        ...updates,
-        updatedAt: new Date().toISOString(),
-      };
-
-      cards.delete(cardIndex, 1);
-      cards.insert(cardIndex, [updatedCard]);
-
-      // 업데이트 후 모든 클라이언트에게 sync 브로드캐스트
-      const state = Y.encodeStateAsUpdate(doc);
-      this.server.to(`cardset:${cardsetId}`).emit('sync', {
-        cardsetId,
-        update: Array.from(state),
-      });
-
-      this.logger.log(`Card ${cardId} updated in cardset ${cardsetId} and sync broadcasted`);
-    } catch (error) {
-      this.logger.error('Error updating card:', error);
-      client.emit('error', { message: 'Failed to update card' });
-    }
-  }
-
-
-  // Yjs 동기화 (클라이언트가 변경사항을 받을 때)
-  @SubscribeMessage('sync')
   async handleSync(
     @WsUser() user: UserAuth,
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { cardsetId: string; syncStep: number; update?: number[] },
+    @MessageBody() data: { cardsetId: string; update?: number[] },
   ) {
     try {
-      const { cardsetId, syncStep, update } = data;
-      this.logger.log(`Sync request from user ${user.userId} for cardset ${cardsetId}`);
+      const { cardsetId, update } = data;
+      this.logger.log(
+        `Sync request from user ${user.userId} for cardset ${cardsetId}`,
+      );
 
       const doc = this.documentMap.get(cardsetId);
       if (!doc) {
@@ -170,14 +123,16 @@ export class CollaborationGateway implements OnGatewayConnection, OnGatewayDisco
       if (update) {
         // 클라이언트에서 온 업데이트 적용
         Y.applyUpdate(doc, new Uint8Array(update));
-        
+
         // 업데이트 적용 후 모든 클라이언트에게 sync 브로드캐스트
         const state = Y.encodeStateAsUpdate(doc);
         this.server.to(`cardset:${cardsetId}`).emit('sync', {
           cardsetId,
           update: Array.from(state),
         });
-        this.logger.log(`Sync update from user ${user.userId} broadcasted to all clients in cardset ${cardsetId}`);
+        this.logger.log(
+          `Sync update from user ${user.userId} broadcasted to all clients in cardset ${cardsetId}`,
+        );
       } else {
         // 업데이트가 없으면 현재 상태를 요청한 클라이언트에게만 전송
         const state = Y.encodeStateAsUpdate(doc);
