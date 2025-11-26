@@ -26,7 +26,9 @@ export class WsAuthGuard implements CanActivate {
         userId: 'test-user',
         email: 'test@example.com',
       };
-      this.logger.warn(`⚠️  테스트 모드: 인증을 건너뛰고 있습니다 (client ${client.id})`);
+      this.logger.warn(
+        `⚠️  테스트 모드: 인증을 건너뛰고 있습니다 (client ${client.id})`,
+      );
       return true;
     }
 
