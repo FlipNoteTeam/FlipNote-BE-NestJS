@@ -150,13 +150,13 @@ export class CollaborationGateway
   @SubscribeMessage('awareness') // ← 클라이언트가 보낸 "awareness" 받음
   handleAwareness(
     client: Socket,
-    payload: { documentId: string; awareness: Uint8Array },
+    payload: { cardsetId: string; awareness: Uint8Array },
   ) {
-    const { documentId, awareness } = payload;
+    const { cardsetId, awareness } = payload;
 
     // 같은 문서에 있는 클라이언트에 "awareness"로 브로드캐스트
-    client.to(documentId).emit('awareness', {
-      data: { documentId, awareness: new Uint8Array(awareness) },
+    client.to(cardsetId).emit('awareness', {
+      data: { cardsetId, awareness: new Uint8Array(awareness) },
     });
   }
 
