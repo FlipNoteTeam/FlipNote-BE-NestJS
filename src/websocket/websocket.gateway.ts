@@ -86,10 +86,14 @@ export class CollaborationGateway
 
       // 클라이언트에게 현재 카드셋 상태 전송 -> 직렬화
       const state = Y.encodeStateAsUpdate(doc);
-
+const wrapper = {
+  cardsetId,
+  update:Array.from(state)
+}
+const blob = Buffer.from(JSON.stringify(wrapper))
       client.emit('sync', {
         cardsetId,
-        update: Array.from(state),
+        blob
       });
 
       this.logger.log(`User ${user.userId} joined cardset ${cardsetId}`);
@@ -106,10 +110,12 @@ export class CollaborationGateway
       try {
         const emptyDoc = new Y.Doc();
         const state = Y.encodeStateAsUpdate(emptyDoc);
-        client.emit('sync', {
+
+        const wrapper = {
           cardsetId,
-          update: Array.from(state),
-        });
+          update:Array.from(state)}
+        const blob = Buffer.from(JSON.stringify(wrapper))
+        client.emit('sync',blob);
         this.logger.warn(
           `Sent empty document to client due to error for cardset ${cardsetId}`,
         );
@@ -196,10 +202,11 @@ export class CollaborationGateway
 
       // 업데이트 적용 후 모든 클라이언트에게 sync 브로드캐스트
       const state = Y.encodeStateAsUpdate(doc);
-      this.server.to(`cardset:${cardsetId}`).emit('sync', {
+      const wrapper = {
         cardsetId,
-        update: state,
-      });
+        update:Array.from(state)}
+      const blob = Buffer.from(JSON.stringify((wrapper)))
+      this.server.to(`cardset:${cardsetId}`).emit('sync', blob);
       this.logger.log(
         `Sync update from user ${user.userId} broadcasted to all clients in cardset ${cardsetId}`,
       );
