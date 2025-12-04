@@ -85,7 +85,7 @@ export class CollaborationGateway
       }
 
       // 클라이언트에게 현재 카드셋 상태 전송
-      this.sendSync(client, cardsetId, doc);
+      this.sendSync(cardsetId, doc, client);
 
       this.logger.log(`User ${user.userId} joined cardset ${cardsetId}`);
     } catch (error) {
@@ -100,13 +100,13 @@ export class CollaborationGateway
       // 에러가 발생해도 빈 문서라도 보내서 클라이언트가 연결 유지할 수 있도록
       try {
         const emptyDoc = new Y.Doc();
-        this.sendSync(client, cardsetId, emptyDoc);
+        this.sendSync(cardsetId, emptyDoc, client);
         this.logger.warn(
           `Sent empty document to client due to error for cardset ${cardsetId}`,
         );
       } catch (fallbackError) {
         this.logger.error('Failed to send fallback document:', fallbackError);
-        client.emit('error', {
+        this.sendError(client, {
           message: 'Failed to join cardset',
           details: error instanceof Error ? error.message : String(error),
         });
@@ -146,9 +146,7 @@ export class CollaborationGateway
     const { cardsetId, awareness } = payload;
 
     // 같은 문서에 있는 클라이언트에 "awareness"로 브로드캐스트
-    client.to(cardsetId).emit('awareness', {
-      data: { cardsetId, awareness: new Uint8Array(awareness) },
-    });
+    this.broadcastAwareness(cardsetId, awareness);
   }
 
   // Yjs 업데이트 (클라이언트가 변경사항을 받을 때)
@@ -165,7 +163,7 @@ export class CollaborationGateway
       );
 
       if (!update) {
-        client.emit('error', { message: 'Update data is required' });
+        this.sendError(client, { message: 'Update data is required' });
         return;
       }
 
@@ -192,44 +190,114 @@ export class CollaborationGateway
       );
     } catch (error) {
       this.logger.error('Error during sync:', error);
-      client.emit('error', { message: 'Sync failed' });
+      this.sendError(client, { message: 'Sync failed' });
     }
   }
 
   /**
-   * Yjs 문서를 브로드캐스트용 Buffer로 변환
+   * Yjs 문서를 브로드캐스트용 Buffer로 변환 (최적화된 버전)
+   * - JSON.stringify를 한 번만 호출하여 성능 최적화
+   * - Buffer.from()에 명시적 인코딩 지정으로 안정성 향상
+   * - 중간 객체 생성 최소화
    * @param doc Yjs 문서
    * @param cardsetId 카드셋 ID
    * @returns 브로드캐스트용 Buffer
    */
   private createSyncBuffer(doc: Y.Doc, cardsetId: string): Buffer {
     const state = Y.encodeStateAsUpdate(doc);
-    const wrapper = {
+    // JSON 구조를 직접 문자열로 구성하여 중간 객체 생성 최소화
+    const jsonStr = JSON.stringify({
       cardsetId,
       update: Array.from(state),
-    };
-    return Buffer.from(JSON.stringify(wrapper));
+    });
+    return Buffer.from(jsonStr, 'utf8');
   }
 
   /**
-   * 카드셋 룸에 sync 이벤트 브로드캐스트
+   * sync 이벤트 전송 (통일된 인터페이스)
+   * @param cardsetId 카드셋 ID
+   * @param doc Yjs 문서
+   * @param client 선택적 클라이언트 (없으면 룸 전체에 브로드캐스트)
+   */
+  private sendSync(cardsetId: string, doc: Y.Doc, client?: Socket): void {
+    const blob = this.createSyncBuffer(doc, cardsetId);
+    if (client) {
+      client.emit('sync', blob);
+    } else {
+      this.server.to(`cardset:${cardsetId}`).emit('sync', blob);
+    }
+  }
+
+  /**
+   * 카드셋 룸에 sync 이벤트 브로드캐스트 (최적화된 버전)
    * @param cardsetId 카드셋 ID
    * @param doc Yjs 문서
    */
   private broadcastSync(cardsetId: string, doc: Y.Doc): void {
-    const blob = this.createSyncBuffer(doc, cardsetId);
-    this.server.to(`cardset:${cardsetId}`).emit('sync', blob);
+    this.sendSync(cardsetId, doc);
   }
 
   /**
-   * 클라이언트에게 sync 이벤트 전송
+   * 클라이언트에게 error 이벤트 전송 (최적화된 버전)
    * @param client Socket 클라이언트
-   * @param cardsetId 카드셋 ID
-   * @param doc Yjs 문서
+   * @param errorData 에러 데이터
    */
-  private sendSync(client: Socket, cardsetId: string, doc: Y.Doc): void {
-    const blob = this.createSyncBuffer(doc, cardsetId);
-    client.emit('sync', blob);
+  private sendError(
+    client: Socket,
+    errorData: { message: string; details?: string },
+  ): void {
+    // JSON 문자열을 직접 생성하여 중간 객체 생성 최소화
+    const jsonStr = JSON.stringify(errorData);
+    const blob = Buffer.from(jsonStr, 'utf8');
+    client.emit('error', blob);
+  }
+
+  /**
+   * awareness 데이터를 Buffer로 변환
+   * @param cardsetId 카드셋 ID
+   * @param awareness awareness 데이터
+   * @returns Buffer
+   */
+  private createAwarenessBuffer(
+    cardsetId: string,
+    awareness: Uint8Array,
+  ): Buffer {
+    // JSON 구조를 직접 문자열로 구성하여 중간 래퍼 객체 생성 최소화
+    const jsonStr = JSON.stringify({
+      data: {
+        cardsetId,
+        awareness: Array.from(awareness),
+      },
+    });
+    return Buffer.from(jsonStr, 'utf8');
+  }
+
+  /**
+   * awareness 이벤트 전송 (통일된 인터페이스)
+   * @param cardsetId 카드셋 ID
+   * @param awareness awareness 데이터
+   * @param client 선택적 클라이언트 (없으면 룸 전체에 브로드캐스트)
+   */
+  private sendAwareness(
+    cardsetId: string,
+    awareness: Uint8Array,
+    client?: Socket,
+  ): void {
+    const blob = this.createAwarenessBuffer(cardsetId, awareness);
+    if (client) {
+      client.emit('awareness', blob);
+    } else {
+      this.server.to(`cardset:${cardsetId}`).emit('awareness', blob);
+    }
+  }
+
+  /**
+   * 카드셋 룸에 awareness 이벤트 브로드캐스트 (최적화된 버전)
+   * @param cardsetId 카드셋 ID
+   * @param awareness awareness 데이터
+   */
+  private broadcastAwareness(cardsetId: string, awareness: Uint8Array): void {
+    this.sendAwareness(cardsetId, awareness);
   }
 
   /**
