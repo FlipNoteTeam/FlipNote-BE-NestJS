@@ -84,17 +84,8 @@ export class CollaborationGateway
         doc = new Y.Doc();
       }
 
-      // 클라이언트에게 현재 카드셋 상태 전송 -> 직렬화
-      const state = Y.encodeStateAsUpdate(doc);
-const wrapper = {
-  cardsetId,
-  update:Array.from(state)
-}
-const blob = Buffer.from(JSON.stringify(wrapper))
-      client.emit('sync', {
-        cardsetId,
-        blob
-      });
+      // 클라이언트에게 현재 카드셋 상태 전송
+      this.sendSync(client, cardsetId, doc);
 
       this.logger.log(`User ${user.userId} joined cardset ${cardsetId}`);
     } catch (error) {
@@ -109,13 +100,7 @@ const blob = Buffer.from(JSON.stringify(wrapper))
       // 에러가 발생해도 빈 문서라도 보내서 클라이언트가 연결 유지할 수 있도록
       try {
         const emptyDoc = new Y.Doc();
-        const state = Y.encodeStateAsUpdate(emptyDoc);
-
-        const wrapper = {
-          cardsetId,
-          update:Array.from(state)}
-        const blob = Buffer.from(JSON.stringify(wrapper))
-        client.emit('sync',blob);
+        this.sendSync(client, cardsetId, emptyDoc);
         this.logger.warn(
           `Sent empty document to client due to error for cardset ${cardsetId}`,
         );
@@ -201,12 +186,7 @@ const blob = Buffer.from(JSON.stringify(wrapper))
       await this.yjsDocumentService.saveUpdate(cardsetId, updateBuffer);
 
       // 업데이트 적용 후 모든 클라이언트에게 sync 브로드캐스트
-      const state = Y.encodeStateAsUpdate(doc);
-      const wrapper = {
-        cardsetId,
-        update:Array.from(state)}
-      const blob = Buffer.from(JSON.stringify((wrapper)))
-      this.server.to(`cardset:${cardsetId}`).emit('sync', blob);
+      this.broadcastSync(cardsetId, doc);
       this.logger.log(
         `Sync update from user ${user.userId} broadcasted to all clients in cardset ${cardsetId}`,
       );
@@ -214,6 +194,42 @@ const blob = Buffer.from(JSON.stringify(wrapper))
       this.logger.error('Error during sync:', error);
       client.emit('error', { message: 'Sync failed' });
     }
+  }
+
+  /**
+   * Yjs 문서를 브로드캐스트용 Buffer로 변환
+   * @param doc Yjs 문서
+   * @param cardsetId 카드셋 ID
+   * @returns 브로드캐스트용 Buffer
+   */
+  private createSyncBuffer(doc: Y.Doc, cardsetId: string): Buffer {
+    const state = Y.encodeStateAsUpdate(doc);
+    const wrapper = {
+      cardsetId,
+      update: Array.from(state),
+    };
+    return Buffer.from(JSON.stringify(wrapper));
+  }
+
+  /**
+   * 카드셋 룸에 sync 이벤트 브로드캐스트
+   * @param cardsetId 카드셋 ID
+   * @param doc Yjs 문서
+   */
+  private broadcastSync(cardsetId: string, doc: Y.Doc): void {
+    const blob = this.createSyncBuffer(doc, cardsetId);
+    this.server.to(`cardset:${cardsetId}`).emit('sync', blob);
+  }
+
+  /**
+   * 클라이언트에게 sync 이벤트 전송
+   * @param client Socket 클라이언트
+   * @param cardsetId 카드셋 ID
+   * @param doc Yjs 문서
+   */
+  private sendSync(client: Socket, cardsetId: string, doc: Y.Doc): void {
+    const blob = this.createSyncBuffer(doc, cardsetId);
+    client.emit('sync', blob);
   }
 
   /**
@@ -229,13 +245,13 @@ const blob = Buffer.from(JSON.stringify(wrapper))
         await this.cardsetService.loadCardsetContentFromDB(numericCardsetId);
       if (doc) {
         // DB에서 로드한 문서를 Redis에 저장 (실패해도 계속 진행)
-        await this.yjsDocumentService.saveDocument(cardsetId, doc).catch(
-          (error) => {
+        await this.yjsDocumentService
+          .saveDocument(cardsetId, doc)
+          .catch((error) => {
             this.logger.warn(
               `Failed to save document to Redis after DB load: ${error}`,
             );
-          },
-        );
+          });
         this.logger.log(
           `Loaded Yjs document from DB and saved to Redis for cardset ${cardsetId}`,
         );
@@ -258,13 +274,13 @@ const blob = Buffer.from(JSON.stringify(wrapper))
     const doc = new Y.Doc();
     this.logger.log(`Created new Yjs document for cardset ${cardsetId}`);
     // Redis 저장 실패해도 문서는 반환 (메모리에서 사용 가능)
-    await this.yjsDocumentService.saveDocument(cardsetId, doc).catch(
-      (error) => {
+    await this.yjsDocumentService
+      .saveDocument(cardsetId, doc)
+      .catch((error) => {
         this.logger.warn(
           `Failed to save new document to Redis: ${error}, continuing anyway`,
         );
-      },
-    );
+      });
     return doc;
   }
 
