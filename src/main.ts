@@ -7,6 +7,9 @@ import { NestExpressApplication } from '@nestjs/platform-express';
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
 
+  // 글로벌 API prefix 설정
+  app.setGlobalPrefix('api/v1');
+
   // 정적 파일 서빙 설정 제거 (YJS 제거로 불필요)
 
   // Socket.IO 어댑터 설정

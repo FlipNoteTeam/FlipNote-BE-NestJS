@@ -1,7 +1,7 @@
 import { Controller, Param, ParseIntPipe, Post } from '@nestjs/common';
 import { CardsetService } from './cardset.service';
 
-@Controller('v1/card-sets')
+@Controller('card-sets')
 export class CardsetController {
   constructor(private readonly cardsetService: CardsetService) {}
 
