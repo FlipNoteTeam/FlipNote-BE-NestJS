@@ -2,6 +2,7 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import * as Y from 'yjs';
+import { randomUUID } from 'crypto';
 import { Cardset } from './entities/cardset.entity';
 import { CardsetContent } from './entities/cardset-content.entity';
 import { YjsDocumentService } from '../websocket/yjs-document.service';
@@ -25,11 +26,11 @@ export class CardsetService {
   /**
    * Yjs 배열에서 카드 데이터를 추출하여 객체 배열로 변환
    * @param cardsArray Yjs 배열
-   * @returns 카드 객체 배열 [{question: string, answer: string}, ...]
+   * @returns 카드 객체 배열 [{id: string, question: string, answer: string}, ...]
    */
   private extractCardsFromYjsArray(
     cardsArray: Y.Array<unknown>,
-  ): Array<{ question: string; answer: string }> {
+  ): Array<{ id: string; question: string; answer: string }> {
     return cardsArray.map((cardMap) => {
       const questionText = (cardMap as Y.Map<unknown>)?.get('question') as
         | Y.Text
@@ -42,6 +43,7 @@ export class CardsetService {
       const answer = answerText ? (answerText as unknown as string) : '';
 
       return {
+        id: randomUUID(),
         question,
         answer,
       };
@@ -158,5 +160,52 @@ export class CardsetService {
     await this.cardsetContentRepository.save(cardsetContent);
 
     await this.yjsDocumentService.flushIncrementalHistory(cardSetId.toString());
+  }
+
+  /**
+   * 카드셋의 카드 목록을 조회
+   * @param cardSetId 카드셋 ID
+   * @returns 카드 객체 배열 [{id: string, question: string, answer: string}, ...]
+   */
+  async getCardsetInCards(
+    cardSetId: number,
+  ): Promise<Array<{ id: string; question: string; answer: string }>> {
+    const cardsetContent = await this.cardsetContentRepository.findOne({
+      where: { cardset: { id: cardSetId } },
+    });
+
+    if (!cardsetContent || !cardsetContent.content) {
+      this.logger.log(
+        `[getCardsetInCards] Cardset ${cardSetId}: No content found, returning empty array`,
+      );
+      return [];
+    }
+
+    try {
+      // JSON 문자열을 파싱하여 배열로 변환
+      const cardsList = JSON.parse(cardsetContent.content) as Array<{
+        id?: string;
+        question: string;
+        answer: string;
+      }>;
+
+      // id가 없는 카드에 UUID 추가
+      const cardsWithId = cardsList.map((card) => ({
+        id: card.id || randomUUID(),
+        question: card.question,
+        answer: card.answer,
+      }));
+
+      this.logger.log(
+        `[getCardsetInCards] Cardset ${cardSetId} - Found ${cardsWithId.length} cards`,
+      );
+
+      return cardsWithId;
+    } catch (error) {
+      this.logger.error(
+        `[getCardsetInCards] Cardset ${cardSetId} - Error parsing content: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return [];
+    }
   }
 }
