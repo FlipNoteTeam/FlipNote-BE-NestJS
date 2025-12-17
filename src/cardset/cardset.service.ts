@@ -128,11 +128,6 @@ export class CardsetService {
       throw new NotFoundException('Cardset snapshot not found in Redis');
     }
 
-    // Redis에서 로드한 Yjs 문서 내용 로그
-    this.logger.log(
-      `[saveCardsetContent] Cardset ${cardSetId} - Redis document content: ${JSON.stringify(doc, null, 2)}`,
-    );
-
     const cardsArray = doc.getArray('cards');
 
     // 카드 배열을 객체 배열로 변환
