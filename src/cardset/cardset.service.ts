@@ -95,16 +95,10 @@ export class CardsetService {
     }
 
     //레디스에서 카드셋 스냅샷 로드
-    this.logger.log(
-      `[saveCardsetContent] Cardset ${cardSetId} - Loading document from Redis...`,
-    );
     const doc = await this.yjsDocumentService.loadDocument(
       cardSetId.toString(),
     );
     if (!doc) {
-      this.logger.error(
-        `[saveCardsetContent] Cardset ${cardSetId} - Document not found in Redis`,
-      );
       throw new NotFoundException('Cardset snapshot not found in Redis');
     }
 
@@ -114,10 +108,19 @@ export class CardsetService {
       `[saveCardsetContent] Cardset ${cardSetId} - Redis document content: ${JSON.stringify(docJson, null, 2)}`,
     );
 
+    const cardsArray = doc.getArray('cards');
 
-    this.logger.log(
-      `[saveCardsetContent] Cardset ${cardSetId} - Redis document content: ${Object.keys(docJson), Object.values(docJson)}`,
-    );
+    cardsArray.forEach((cardMap) => {
+      //@ts-ignore
+      const questionText = cardMap!.get('question') as Y.Text;
+      //@ts-ignore
+      const answerText = cardMap!.get('answer') as Y.Text;
+
+      this.logger.log(
+        `[saveCardsetContent] Cardset ${cardSetId} - Card question: ${questionText.toString()}`,
+        `[saveCardsetContent] Cardset ${cardSetId} - Card answer: ${answerText.toString()}`,
+      );
+    });
 
     // Yjs 문서의 바이너리 상태도 로그 (디버깅용)
     const stateUpdate = Y.encodeStateAsUpdate(doc);
@@ -125,10 +128,10 @@ export class CardsetService {
       `[saveCardsetContent] Cardset ${cardSetId} - Yjs state update size: ${stateUpdate.length} bytes`,
     );
 
-    const jsonContent = docJson ?? {};
-    this.logger.log(
-      `[saveCardsetContent] Cardset ${cardSetId} - Serialized JSON content length: ${jsonContent} characters`,
-    );
+    const jsonContent = docJson;
+    // this.logger.log(
+    //   `[saveCardsetContent] Cardset ${cardSetId} - Serialized JSON content length: ${jsonContent.length} characters`,
+    // );
 
     //카드셋 내용 없으면 새로 생성
     let cardsetContent = await this.cardsetContentRepository.findOne({
@@ -149,20 +152,8 @@ export class CardsetService {
       `[saveCardsetContent] Cardset ${cardSetId} - Serialized JSON content length: ${cardsetContent.content} characters`,
     );
 
-    this.logger.log(
-      `[saveCardsetContent] Cardset ${cardSetId} - Saving to database...`,
-    );
     await this.cardsetContentRepository.save(cardsetContent);
-    this.logger.log(
-      `[saveCardsetContent] Cardset ${cardSetId} - Successfully saved to database`,
-    );
 
-    this.logger.log(
-      `[saveCardsetContent] Cardset ${cardSetId} - Flushing incremental history...`,
-    );
     await this.yjsDocumentService.flushIncrementalHistory(cardSetId.toString());
-    this.logger.log(
-      `[saveCardsetContent] Cardset ${cardSetId} - Successfully flushed incremental history`,
-    );
   }
 }

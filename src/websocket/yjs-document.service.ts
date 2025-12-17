@@ -106,48 +106,15 @@ export class YjsDocumentService implements OnModuleInit, OnModuleDestroy {
       }
 
       const key = `yjs:cardset:${cardsetId}`;
-      this.logger.log(
-        `[loadDocument] Cardset ${cardsetId} - Loading from Redis key: ${key}`,
-      );
       const data = await this.redisClient.getBuffer(key);
 
       if (!data) {
-        this.logger.log(
-          `[loadDocument] Cardset ${cardsetId} - No data found in Redis`,
-        );
         return null;
       }
 
-      // Redis에서 로드한 바이너리 데이터 정보 로그
-      this.logger.log(
-        `[loadDocument] Cardset ${cardsetId} - Redis binary data size: ${data.length} bytes`,
-      );
-      this.logger.debug(
-        `[loadDocument] Cardset ${cardsetId} - Redis binary data (first 100 bytes): ${Array.from(
-          data.slice(0, 100),
-        )
-          .map((b) => b.toString(16).padStart(2, '0'))
-          .join(' ')}`,
-      );
-
       const doc = new Y.Doc();
       Y.applyUpdate(doc, data);
-
-      // Yjs 문서로 변환한 후의 내용 로그
-      const docJson = doc;
-      this.logger.log(
-        `[loadDocument] Cardset ${cardsetId} - Yjs document content: ${JSON.stringify(docJson, null, 2)}`,
-      );
-
-      // Yjs 문서의 상태 업데이트 크기 로그
-      const stateUpdate = Y.encodeStateAsUpdate(doc);
-      this.logger.debug(
-        `[loadDocument] Cardset ${cardsetId} - Yjs state update size: ${stateUpdate.length} bytes`,
-      );
-
-      this.logger.log(
-        `[loadDocument] Cardset ${cardsetId} - Successfully loaded Yjs document from Redis`,
-      );
+      this.logger.debug(`Loaded Yjs document for cardset ${cardsetId}`);
       return doc;
     } catch (error) {
       this.logger.error(
