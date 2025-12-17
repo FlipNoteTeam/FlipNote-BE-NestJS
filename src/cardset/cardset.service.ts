@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import * as Y from 'yjs';
@@ -8,6 +8,8 @@ import { YjsDocumentService } from '../websocket/yjs-document.service';
 
 @Injectable()
 export class CardsetService {
+  private readonly logger = new Logger(CardsetService.name);
+
   constructor(
     @InjectRepository(Cardset)
     private readonly cardsetRepository: Repository<Cardset>,
@@ -32,14 +34,27 @@ export class CardsetService {
       });
 
       if (!cardsetContent || !cardsetContent.content) {
+        this.logger.log(
+          `[loadCardsetContentFromDB] Cardset ${cardSetId}: No content found`,
+        );
         return null;
       }
+
+      // 원본 JSON 문자열 로그
+      this.logger.log(
+        `[loadCardsetContentFromDB] Cardset ${cardSetId} - Original content: ${cardsetContent.content.substring(0, 200)}${cardsetContent.content.length > 200 ? '...' : ''}`,
+      );
 
       // JSON 문자열을 파싱
       const jsonContent = JSON.parse(cardsetContent.content) as Record<
         string,
         unknown
       >;
+
+      // 파싱된 JSON 내용 로그
+      this.logger.log(
+        `[loadCardsetContentFromDB] Cardset ${cardSetId} - Parsed JSON: ${JSON.stringify(jsonContent, null, 2)}`,
+      );
 
       // Y.Doc 생성 및 JSON 데이터 적용
       const doc = new Y.Doc();
@@ -50,12 +65,22 @@ export class CardsetService {
         const yMap = doc.getMap('content');
         for (const [key, value] of Object.entries(jsonContent)) {
           yMap.set(key, value);
+          this.logger.debug(
+            `[loadCardsetContentFromDB] Cardset ${cardSetId} - Set Y.Map key: ${key}, value: ${JSON.stringify(value)}`,
+          );
         }
       }
+
+      this.logger.log(
+        `[loadCardsetContentFromDB] Cardset ${cardSetId} - Successfully loaded and converted to Y.Doc`,
+      );
 
       return doc;
     } catch (error) {
       // 테이블이 없거나 조회 실패 시 null 반환 (에러 throw 안 함)
+      this.logger.error(
+        `[loadCardsetContentFromDB] Cardset ${cardSetId} - Error loading content: ${error instanceof Error ? error.message : String(error)}`,
+      );
       return null;
     }
   }

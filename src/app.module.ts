@@ -31,7 +31,9 @@ import { WebSocketModule } from './websocket/websocket.module';
         CardSetManager,
         Card,
       ],
-      synchronize: false,
+      synchronize: process.env.DB_SYNCHRONIZE === 'true' || process.env.NODE_ENV !== 'production',
+      dropSchema: false, // 기존 스키마 보존
+      migrationsRun: false, // 마이그레이션 자동 실행 비활성화
     }),
     CardsetModule,
     CardsetManagerModule,
