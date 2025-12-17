@@ -23,6 +23,32 @@ export class CardsetService {
   }
 
   /**
+   * Yjs 배열에서 카드 데이터를 추출하여 객체 배열로 변환
+   * @param cardsArray Yjs 배열
+   * @returns 카드 객체 배열 [{question: string, answer: string}, ...]
+   */
+  private extractCardsFromYjsArray(
+    cardsArray: Y.Array<unknown>,
+  ): Array<{ question: string; answer: string }> {
+    return cardsArray.map((cardMap) => {
+      const questionText = (cardMap as Y.Map<unknown>)?.get('question') as
+        | Y.Text
+        | undefined;
+      const answerText = (cardMap as Y.Map<unknown>)?.get('answer') as
+        | Y.Text
+        | undefined;
+
+      const question = questionText ? (questionText as unknown as string) : '';
+      const answer = answerText ? (answerText as unknown as string) : '';
+
+      return {
+        question,
+        answer,
+      };
+    });
+  }
+
+  /**
    * DB에서 카드셋 내용을 로드하여 Y.Doc으로 변환
    * @param cardSetId 카드셋 ID
    * @returns Y.Doc 객체 또는 null (DB에 없으면)
@@ -103,35 +129,20 @@ export class CardsetService {
     }
 
     // Redis에서 로드한 Yjs 문서 내용 로그
-    const docJson = doc;
     this.logger.log(
-      `[saveCardsetContent] Cardset ${cardSetId} - Redis document content: ${JSON.stringify(docJson, null, 2)}`,
+      `[saveCardsetContent] Cardset ${cardSetId} - Redis document content: ${JSON.stringify(doc, null, 2)}`,
     );
 
     const cardsArray = doc.getArray('cards');
 
-    cardsArray.forEach((cardMap) => {
-      //@ts-ignore
-      const questionText = cardMap!.get('question') as Y.Text;
-      //@ts-ignore
-      const answerText = cardMap!.get('answer') as Y.Text;
+    // 카드 배열을 객체 배열로 변환
+    const cardsList = this.extractCardsFromYjsArray(cardsArray);
 
-      this.logger.log(
-        `[saveCardsetContent] Cardset ${cardSetId} - Card question: ${questionText.toString()}`,
-        `[saveCardsetContent] Cardset ${cardSetId} - Card answer: ${answerText.toString()}`,
-      );
-    });
-
-    // Yjs 문서의 바이너리 상태도 로그 (디버깅용)
-    const stateUpdate = Y.encodeStateAsUpdate(doc);
-    this.logger.debug(
-      `[saveCardsetContent] Cardset ${cardSetId} - Yjs state update size: ${stateUpdate.length} bytes`,
+    // 배열을 문자열로 변환
+    const cardsListString = JSON.stringify(cardsList);
+    this.logger.log(
+      `[saveCardsetContent] Cardset ${cardSetId} - Cards list: ${cardsListString}`,
     );
-
-    const jsonContent = docJson;
-    // this.logger.log(
-    //   `[saveCardsetContent] Cardset ${cardSetId} - Serialized JSON content length: ${jsonContent.length} characters`,
-    // );
 
     //카드셋 내용 없으면 새로 생성
     let cardsetContent = await this.cardsetContentRepository.findOne({
@@ -146,11 +157,8 @@ export class CardsetService {
       });
     }
 
-    cardsetContent.content = Buffer.from(JSON.stringify(jsonContent)).toString("base64");
-
-    this.logger.log(
-      `[saveCardsetContent] Cardset ${cardSetId} - Serialized JSON content length: ${cardsetContent.content} characters`,
-    );
+    //카드셋 내용 저장
+    cardsetContent.content = cardsListString;
 
     await this.cardsetContentRepository.save(cardsetContent);
 
