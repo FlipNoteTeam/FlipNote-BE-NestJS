@@ -6,7 +6,10 @@ import { CardsetIncremental } from '../cardset/entities/cardset-incremental.enti
 
 describe('YjsDocumentService', () => {
   let service: YjsDocumentService;
-  let repositoryMock: any;
+  let repositoryMock: {
+    create: jest.Mock;
+    save: jest.Mock;
+  };
 
   beforeEach(async () => {
     repositoryMock = {
@@ -45,4 +48,3 @@ describe('YjsDocumentService', () => {
   // 실제 Redis 연결이 필요한 테스트는 test-yjs-integration.ts에서 실행
   // Jest 유닛 테스트는 서비스 구조만 확인
 });
-
