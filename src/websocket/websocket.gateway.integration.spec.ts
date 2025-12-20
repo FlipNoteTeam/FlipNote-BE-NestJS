@@ -4,12 +4,15 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { CollaborationGateway } from './websocket.gateway';
 import { YjsDocumentService } from './yjs-document.service';
 import { CardsetService } from '../cardset/cardset.service';
+import { AuthService } from '../auth/auth.service';
+import { WsAuthGuard } from '../auth/ws-auth.guard';
 import { CardsetIncremental } from '../cardset/entities/cardset-incremental.entity';
 import { Cardset } from '../cardset/entities/cardset.entity';
 import { CardsetContent } from '../cardset/entities/cardset-content.entity';
 import { Server, Socket } from 'socket.io';
 import * as Y from 'yjs';
 import type { UserAuth } from '../types/userAuth.type';
+import authConfig from '../config/authConfig';
 
 describe('CollaborationGateway Integration', () => {
   let gateway: CollaborationGateway;
@@ -17,6 +20,19 @@ describe('CollaborationGateway Integration', () => {
   let cardsetService: CardsetService;
   let mockSocket: Partial<Socket>;
   let mockServer: Partial<Server>;
+  let mockRedisClient: {
+    getBuffer: jest.Mock;
+    set: jest.Mock;
+    del: jest.Mock;
+    expire: jest.Mock;
+    rpush: jest.Mock;
+    lrange: jest.Mock;
+    sadd: jest.Mock;
+    srem: jest.Mock;
+    scard: jest.Mock;
+    smembers: jest.Mock;
+    on: jest.Mock;
+  };
 
   beforeEach(async () => {
     mockSocket = {
@@ -33,11 +49,27 @@ describe('CollaborationGateway Integration', () => {
       }),
     };
 
+    mockRedisClient = {
+      getBuffer: jest.fn(),
+      set: jest.fn(),
+      del: jest.fn(),
+      expire: jest.fn(),
+      rpush: jest.fn(),
+      lrange: jest.fn(),
+      sadd: jest.fn(),
+      srem: jest.fn(),
+      scard: jest.fn(),
+      smembers: jest.fn(),
+      on: jest.fn(),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         CollaborationGateway,
         YjsDocumentService,
         CardsetService,
+        AuthService,
+        WsAuthGuard,
         {
           provide: ConfigService,
           useValue: {
@@ -47,6 +79,12 @@ describe('CollaborationGateway Integration', () => {
               if (key === 'YJS_MYSQL_FLUSH_DELAY_MS') return 1000;
               return null;
             }),
+          },
+        },
+        {
+          provide: authConfig.KEY,
+          useValue: {
+            jwtSecret: 'test-secret',
           },
         },
         {
@@ -78,6 +116,10 @@ describe('CollaborationGateway Integration', () => {
     cardsetService = module.get<CardsetService>(CardsetService);
 
     gateway.server = mockServer as Server;
+
+    // Redis 클라이언트 모킹
+    (yjsDocumentService as unknown as { redisClient: unknown }).redisClient =
+      mockRedisClient;
   });
 
   it('should be defined', () => {
@@ -88,18 +130,21 @@ describe('CollaborationGateway Integration', () => {
 
   describe('join-cardset flow', () => {
     it('should load document from Redis when available', async () => {
-      const cardsetId = 'test-join-1';
+      const cardsetId = '1';
       const user: UserAuth = {
         userId: 'user-1',
         role: 'user',
         tokenVersion: 1,
       };
 
-      // Redis에 문서 저장
+      // Redis에 문서 저장 모킹
       const doc = new Y.Doc();
       const testArray = doc.getArray('test');
       testArray.push(['data1']);
-      await yjsDocumentService.saveDocument(cardsetId, doc);
+      const state = Y.encodeStateAsUpdate(doc);
+      mockRedisClient.getBuffer.mockResolvedValue(Buffer.from(state));
+      mockRedisClient.set.mockResolvedValue('OK');
+      mockRedisClient.expire.mockResolvedValue(1);
 
       // join-cardset 호출
       await gateway.handleJoinCardset(user, mockSocket as Socket, {
@@ -108,19 +153,19 @@ describe('CollaborationGateway Integration', () => {
 
       expect(mockSocket.join).toHaveBeenCalledWith(`cardset:${cardsetId}`);
       expect(mockSocket.emit).toHaveBeenCalledWith('sync', expect.any(Object));
-
-      // 정리
-      await yjsDocumentService.deleteDocument(cardsetId);
     });
 
     it('should load from DB when Redis is empty', async () => {
-      const cardsetId = 'test-join-2';
+      const cardsetId = '2';
       const numericId = 2;
       const user: UserAuth = {
         userId: 'user-2',
         role: 'user',
         tokenVersion: 1,
       };
+
+      // Redis가 비어있음을 모킹
+      mockRedisClient.getBuffer.mockResolvedValue(null);
 
       // DB에서 로드하는 메서드 모킹
       const dbDoc = new Y.Doc();
@@ -136,18 +181,18 @@ describe('CollaborationGateway Integration', () => {
 
       expect(loadFromDBSpy).toHaveBeenCalledWith(numericId);
       expect(mockSocket.emit).toHaveBeenCalledWith('sync', expect.any(Object));
-
-      // 정리
-      await yjsDocumentService.deleteDocument(cardsetId);
     });
 
     it('should create new document when both Redis and DB are empty', async () => {
-      const cardsetId = 'test-join-3';
+      const cardsetId = '3';
       const user: UserAuth = {
         userId: 'user-3',
         role: 'user',
         tokenVersion: 1,
       };
+
+      // Redis가 비어있음을 모킹
+      mockRedisClient.getBuffer.mockResolvedValue(null);
 
       // DB에서도 null 반환
       jest
@@ -159,27 +204,36 @@ describe('CollaborationGateway Integration', () => {
       });
 
       expect(mockSocket.emit).toHaveBeenCalledWith('sync', expect.any(Object));
-
-      // 정리
-      await yjsDocumentService.deleteDocument(cardsetId);
     });
   });
 
   describe('update flow', () => {
     it('should apply update and broadcast to all clients', async () => {
-      const cardsetId = 'test-update-1';
+      const cardsetId = '1';
       const user: UserAuth = {
         userId: 'user-4',
         role: 'user',
         tokenVersion: 1,
       };
 
-      // 문서 생성
+      // 문서 생성 및 유효한 업데이트 생성
       const doc = new Y.Doc();
-      await yjsDocumentService.saveDocument(cardsetId, doc);
+      const testArray = doc.getArray('test');
+      testArray.push(['initial']);
+      const initialState = Y.encodeStateAsUpdate(doc);
 
-      // 업데이트 데이터
-      const update = new Uint8Array([1, 2, 3, 4, 5]);
+      // 업데이트 적용
+      const updateDoc = new Y.Doc();
+      Y.applyUpdate(updateDoc, initialState);
+      updateDoc.getArray('test').push(['new-item']);
+      const update = Y.encodeStateAsUpdate(updateDoc);
+
+      // Redis 모킹
+      mockRedisClient.getBuffer.mockResolvedValue(Buffer.from(initialState));
+      mockRedisClient.set.mockResolvedValue('OK');
+      mockRedisClient.expire.mockResolvedValue(1);
+      mockRedisClient.rpush.mockResolvedValue(1);
+
       const updateArray = Array.from(update);
 
       const mockEmit = jest.fn();
@@ -194,9 +248,6 @@ describe('CollaborationGateway Integration', () => {
 
       expect(mockServer.to).toHaveBeenCalledWith(`cardset:${cardsetId}`);
       expect(mockEmit).toHaveBeenCalledWith('sync', expect.any(Object));
-
-      // 정리
-      await yjsDocumentService.deleteDocument(cardsetId);
     });
   });
 });
