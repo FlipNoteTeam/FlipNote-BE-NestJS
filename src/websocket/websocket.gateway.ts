@@ -304,8 +304,17 @@ export class CollaborationGateway
    * DB에서 문서를 로드하거나 없으면 새로 생성
    * DB에서 로드한 경우 Redis에 저장
    */
-  private async loadDocumentFromDBOrCreate(cardsetId: string): Promise<Y.Doc> {
+  private async loadDocumentFromDBOrCreate(
+    cardsetId: string,
+  ): Promise<Y.Doc | null> {
     const numericCardsetId = Number(cardsetId);
+
+    if (Number.isNaN(numericCardsetId)) {
+      this.logger.error(
+        `Cannot load document from DB for cardset ${cardsetId}: invalid numeric id`,
+      );
+      return null;
+    }
 
     try {
       // DB에서 로드 시도
