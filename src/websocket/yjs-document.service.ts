@@ -260,6 +260,13 @@ export class YjsDocumentService implements OnModuleInit, OnModuleDestroy {
 
     try {
       // Redis에서 증분 업데이트 리스트 조회
+      if (!this.redisClient) {
+        this.logger.error(
+          `Redis client not initialized for cardset ${cardsetId}`,
+        );
+        return;
+      }
+
       const updates = await this.redisClient.lrange(historyKey, 0, -1);
       if (updates.length === 0) {
         this.logger.debug(
@@ -300,6 +307,10 @@ export class YjsDocumentService implements OnModuleInit, OnModuleDestroy {
     try {
       const key = `yjs:cardset:${cardsetId}`;
       await this.redisClient.del(key);
+
+      const historyKey = `yjs:cardset:${cardsetId}:updates`;
+      await this.redisClient.del(historyKey);
+
       this.logger.debug(`Deleted Yjs document for cardset ${cardsetId}`);
     } catch (error) {
       this.logger.error(
