@@ -7,7 +7,7 @@ export class CardsetController {
   constructor(private readonly cardsetService: CardsetService) {}
 
   @Post(':cardSetId')
-  async saveCardsetSnapshot(
+  async saveCardsetContent(
     @Param('cardSetId', ParseIntPipe) cardSetId: number,
   ) {
     await this.cardsetService.saveCardsetContent(cardSetId);
