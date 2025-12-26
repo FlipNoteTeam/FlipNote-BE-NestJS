@@ -32,8 +32,8 @@ import { WebSocketModule } from './websocket/websocket.module';
         Card,
       ],
       synchronize:
-        process.env.DB_SYNCHRONIZE === 'true' ||
-        process.env.NODE_ENV !== 'production',
+        process.env.NODE_ENV !== 'production' &&
+        process.env.DB_SYNCHRONIZE === 'true',
       dropSchema: false, // 기존 스키마 보존
       migrationsRun: false, // 마이그레이션 자동 실행 비활성화
     }),
