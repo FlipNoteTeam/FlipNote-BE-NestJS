@@ -38,12 +38,16 @@ export class CardsetService {
       const answerText = (cardMap as Y.Map<unknown>)?.get('answer') as
         | Y.Text
         | undefined;
+      const idText = (cardMap as Y.Map<unknown>)?.get('id') as
+        | Y.Text
+        | undefined;
 
       const question = questionText ? (questionText as unknown as string) : '';
       const answer = answerText ? (answerText as unknown as string) : '';
+      const id = idText ? (idText as unknown as string) : '';
 
       return {
-        id: randomUUID(),
+        id,
         question,
         answer,
       };
