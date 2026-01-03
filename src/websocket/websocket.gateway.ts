@@ -2,20 +2,28 @@ import {
   WebSocketGateway,
   WebSocketServer,
   SubscribeMessage,
+  ConnectedSocket,
+  MessageBody,
   OnGatewayConnection,
   OnGatewayDisconnect,
-  MessageBody,
-  ConnectedSocket,
 } from '@nestjs/websockets';
+import { Inject, Logger, UseGuards, forwardRef } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
-import { Logger } from '@nestjs/common';
 import * as Y from 'yjs';
+import { WsAuthGuard } from '../auth/ws-auth.guard';
+import { WsUser } from '../decorators/ws-user.decorator';
+import type { UserAuth } from '../types/userAuth.type';
+import { YjsDocumentService } from './yjs-document.service';
+import { CardsetService } from '../cardset/cardset.service';
 
+@UseGuards(WsAuthGuard) // 인증 가드 적용
 @WebSocketGateway({
   cors: {
     origin: '*',
   },
   namespace: '/cardsets',
+  pingTimeout: 60000, // 60초
+  pingInterval: 25000, // 25초
 })
 export class CollaborationGateway
   implements OnGatewayConnection, OnGatewayDisconnect
@@ -23,349 +31,383 @@ export class CollaborationGateway
   @WebSocketServer()
   server: Server;
 
-  private readonly logger = new Logger(CollaborationGateway.name);
-  private readonly heartbeatInterval = 10000; // 10초
-  private heartbeatTimers = new Map<string, NodeJS.Timeout>();
-  private documentMap = new Map<string, Y.Doc>(); // documentId -> Y.Doc
+  private static readonly FLUSH_DELAY_MS = 5000;
 
-  constructor() {}
+  private readonly logger = new Logger(CollaborationGateway.name);
+  private flushTimeouts = new Map<string, NodeJS.Timeout>();
+
+  constructor(
+    private readonly yjsDocumentService: YjsDocumentService,
+    @Inject(forwardRef(() => CardsetService))
+    private readonly cardsetService: CardsetService,
+  ) {}
 
   handleConnection(client: Socket) {
     this.logger.log(`Client connected: ${client.id}`);
-
-    // 10초마다 헬스체크 시작
-    this.startHeartbeat(client);
   }
 
-  handleDisconnect(client: Socket) {
+  async handleDisconnect(client: Socket) {
     this.logger.log(`Client disconnected: ${client.id}`);
-    this.logger.log(
-      `Disconnect reason: ${client.disconnected ? 'Client initiated' : 'Server initiated'}`,
-    );
-
-    this.stopHeartbeat(client.id);
+    await this.removeClientFromAllCardsets(client);
   }
 
-  @SubscribeMessage('joinRoom')
-  handleJoinDocument(
+  // 카드셋에 조인 (카드셋의 Yjs 문서에 접근)
+  @SubscribeMessage('join-cardset')
+  async handleJoinCardset(
+    @WsUser() user: UserAuth,
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { documentId: string; userId?: string },
+    @MessageBody() data: { cardsetId: string },
+  ) {
+    const { cardsetId } = data;
+    this.logger.log(`User ${user.userId} joining cardset ${cardsetId}`);
+
+    try {
+      // 카드셋 룸에 조인
+      void client.join(`cardset:${cardsetId}`);
+
+      // TODO: 카드셋 룸에 조인 시 클라이언트 등록 및 플러시 스케줄링 기능
+      // await this.yjsDocumentService.registerClient(cardsetId, client.id);
+      // this.clearScheduledFlush(cardsetId);
+
+      // Redis에서 문서 로드 시도
+      let doc = await this.yjsDocumentService.loadDocument(cardsetId);
+      if (!doc) {
+        // Redis에 없으면 DB에서 확인
+        doc = await this.loadDocumentFromDBOrCreate(cardsetId);
+      }
+
+      // 문서가 없으면 새로 생성 (최후의 수단)
+      if (!doc) {
+        this.logger.warn(
+          `Failed to load or create document for cardset ${cardsetId}, creating empty document`,
+        );
+        doc = new Y.Doc();
+      }
+
+      // 클라이언트에게 현재 카드셋 상태 전송
+      this.sendSync(cardsetId, doc, client);
+
+      this.logger.log(`User ${user.userId} joined cardset ${cardsetId}`);
+    } catch (error) {
+      this.logger.error('Error joining cardset:', error);
+      this.logger.error('Error details:', {
+        cardsetId,
+        userId: user?.userId,
+        errorMessage: error instanceof Error ? error.message : String(error),
+        errorStack: error instanceof Error ? error.stack : undefined,
+      });
+
+      // 에러가 발생해도 빈 문서라도 보내서 클라이언트가 연결 유지할 수 있도록
+      try {
+        const emptyDoc = new Y.Doc();
+        this.sendSync(cardsetId, emptyDoc, client);
+        this.logger.warn(
+          `Sent empty document to client due to error for cardset ${cardsetId}`,
+        );
+      } catch (fallbackError) {
+        this.logger.error('Failed to send fallback document:', fallbackError);
+        this.sendError(client, {
+          message: 'Failed to join cardset',
+          details: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  // 카드셋에서 나가기
+  @SubscribeMessage('leave-cardset')
+  handleLeaveCardset(
+    @WsUser() user: UserAuth,
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { cardsetId: string },
   ) {
     try {
+      const { cardsetId } = data;
+      this.logger.log(`User ${user.userId} leaving cardset ${cardsetId}`);
+
+      void client.leave(`cardset:${cardsetId}`);
+      // await this.yjsDocumentService.unregisterClient(cardsetId, client.id);
+      // const activeCount =
+      //   await this.yjsDocumentService.getActiveClientCount(cardsetId);
+      // if (activeCount === 0) {
+      //   this.scheduleFlush(cardsetId);
+      // }
+      this.logger.log(`User ${user.userId} left cardset ${cardsetId}`);
+    } catch (error) {
+      this.logger.error('Error leaving cardset:', error);
+    }
+  }
+
+  @SubscribeMessage('awareness') // ← 클라이언트가 보낸 "awareness" 받음
+  handleAwareness(
+    client: Socket,
+    payload: { cardsetId: string; awareness: Uint8Array },
+  ) {
+    const { cardsetId, awareness } = payload;
+
+    // 같은 문서에 있는 클라이언트에 "awareness"로 브로드캐스트
+    this.broadcastAwareness(cardsetId, awareness);
+  }
+
+  // Yjs 업데이트 (클라이언트가 변경사항을 받을 때)
+  @SubscribeMessage('update')
+  async handleUpdate(
+    @WsUser() user: UserAuth,
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { cardsetId: string; update?: number[] },
+  ) {
+    try {
+      const { cardsetId, update } = data;
       this.logger.log(
-        `Client ${client.id} joining document: ${data.documentId}`,
+        `Sync request from user ${user.userId} for cardset ${cardsetId}`,
       );
 
-      // 클라이언트를 룸에 조인
-      void client.join(data.documentId);
+      if (!update) {
+        this.sendError(client, { message: 'Update data is required' });
+        return;
+      }
 
-      // Yjs 문서 초기화 또는 가져오기
-      let doc = this.documentMap.get(data.documentId);
+      // Redis에서 문서 로드
+      let doc = await this.yjsDocumentService.loadDocument(cardsetId);
       if (!doc) {
         doc = new Y.Doc();
-        this.documentMap.set(data.documentId, doc);
-      }
-
-      // 클라이언트에게 현재 문서 상태 전송
-      const state = Y.encodeStateAsUpdate(doc);
-      client.emit('yjs-update', {
-        documentId: data.documentId,
-        update: Array.from(state),
-      });
-
-      // 조인 성공 응답
-      client.emit('joinRoom', {
-        documentId: data.documentId,
-        clientId: client.id,
-        timestamp: new Date().toISOString(),
-      });
-
-      // 다른 클라이언트들에게 새 클라이언트 알림
-      client.to(data.documentId).emit('user-joined', {
-        clientId: client.id,
-        userId: data.userId,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error) {
-      this.logger.error(
-        `Error joining document: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-      client.emit('error', { message: 'Failed to join document' });
-    }
-  }
-
-  @SubscribeMessage('leaveRoom')
-  handleLeaveDocument(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { documentId: string },
-  ) {
-    try {
-      this.logger.log(
-        `Client ${client.id} leaving document: ${data.documentId}`,
-      );
-
-      // YJS 서비스 제거로 인한 간단한 처리
-
-      // 룸에서 나가기
-      void client.leave(data.documentId);
-
-      // 나가기 성공 응답
-      client.emit('userLeft', {
-        documentId: data.documentId,
-        clientId: client.id,
-        timestamp: new Date().toISOString(),
-      });
-
-      // 다른 클라이언트들에게 클라이언트 나감 알림
-      client.to(data.documentId).emit('userLeft', {
-        clientId: client.id,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error) {
-      this.logger.error(
-        `Error leaving document: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-      client.emit('error', { message: 'Failed to leave document' });
-    }
-  }
-
-  @SubscribeMessage('sendMessage')
-  handleTextUpdate(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { documentId: string; field: string; content: string },
-  ) {
-    try {
-      this.logger.log(
-        `Received text update from client ${client.id} for document ${data.documentId} (${data.field})`,
-      );
-
-      // 텍스트 업데이트를 다른 클라이언트들에게 브로드캐스트
-      client.to(data.documentId).emit('text-update', {
-        documentId: data.documentId,
-        field: data.field,
-        content: data.content,
-        fromClientId: client.id,
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error) {
-      this.logger.error(
-        `Error broadcasting text update: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-    }
-  }
-
-  @SubscribeMessage('yjs-message')
-  handleYjsMessage(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { documentId?: string; type: string; data: any },
-  ) {
-    try {
-      this.logger.log(
-        `Received yjs-message from client ${client.id}: ${JSON.stringify(data)}`,
-      );
-
-      const {
-        documentId,
-        type,
-        data: messageData,
-      } = data as { documentId?: string; type: string; data: unknown };
-
-      // auth 메시지 처리
-      if (type === 'auth') {
-        this.handleAuth(
-          client,
-          messageData as { token: string; userId: string; documentId: string },
+        this.logger.log(
+          `Created new Yjs document for cardset ${cardsetId} during update`,
         );
-        return;
       }
 
-      // documentId가 없으면 에러
-      if (!documentId) {
-        this.logger.warn(`Document ID required for client ${client.id}`);
-        client.emit('error', { message: 'Document ID required' });
-        return;
+      // 클라이언트에서 온 업데이트 적용 -> 증분값
+      const updateBuffer = new Uint8Array(update);
+      Y.applyUpdate(doc, updateBuffer);
+
+      // Redis에 업데이트 저장 (증분값과 스냅샷 모두 저장)
+      await this.yjsDocumentService.saveUpdate(cardsetId, updateBuffer);
+
+      // 업데이트 적용 후 모든 클라이언트에게 sync 브로드캐스트
+      this.broadcastSync(cardsetId, doc);
+      this.logger.log(
+        `Sync update from user ${user.userId} broadcasted to all clients in cardset ${cardsetId}`,
+      );
+    } catch (error) {
+      this.logger.error('Error during sync:', error);
+      this.sendError(client, { message: 'Sync failed' });
+    }
+  }
+
+  /**
+   * Yjs 문서를 브로드캐스트용 Buffer로 변환 (최적화된 버전)
+   * - JSON.stringify를 한 번만 호출하여 성능 최적화
+   * - Buffer.from()에 명시적 인코딩 지정으로 안정성 향상
+   * - 중간 객체 생성 최소화
+   * @param doc Yjs 문서
+   * @param cardsetId 카드셋 ID
+   * @returns 브로드캐스트용 Buffer
+   */
+  private createSyncBuffer(doc: Y.Doc, cardsetId: string): Buffer {
+    const state = Y.encodeStateAsUpdate(doc);
+    // JSON 구조를 직접 문자열로 구성하여 중간 객체 생성 최소화
+    const jsonStr = JSON.stringify({
+      cardsetId,
+      update: Array.from(state),
+    });
+    return Buffer.from(jsonStr, 'utf8');
+  }
+
+  /**
+   * sync 이벤트 전송 (통일된 인터페이스)
+   * @param cardsetId 카드셋 ID
+   * @param doc Yjs 문서
+   * @param client 선택적 클라이언트 (없으면 룸 전체에 브로드캐스트)
+   */
+  private sendSync(cardsetId: string, doc: Y.Doc, client?: Socket): void {
+    const blob = this.createSyncBuffer(doc, cardsetId);
+    if (client) {
+      client.emit('sync', blob);
+    } else {
+      this.server.to(`cardset:${cardsetId}`).emit('sync', blob);
+    }
+  }
+
+  /**
+   * 카드셋 룸에 sync 이벤트 브로드캐스트 (최적화된 버전)
+   * @param cardsetId 카드셋 ID
+   * @param doc Yjs 문서
+   */
+  private broadcastSync(cardsetId: string, doc: Y.Doc): void {
+    this.sendSync(cardsetId, doc);
+  }
+
+  /**
+   * 클라이언트에게 error 이벤트 전송 (최적화된 버전)
+   * @param client Socket 클라이언트
+   * @param errorData 에러 데이터
+   */
+  private sendError(
+    client: Socket,
+    errorData: { message: string; details?: string },
+  ): void {
+    // JSON 문자열을 직접 생성하여 중간 객체 생성 최소화
+    const jsonStr = JSON.stringify(errorData);
+    const blob = Buffer.from(jsonStr, 'utf8');
+    client.emit('error', blob);
+  }
+
+  /**
+   * awareness 데이터를 Buffer로 변환
+   * @param cardsetId 카드셋 ID
+   * @param awareness awareness 데이터
+   * @returns Buffer
+   */
+  private createAwarenessBuffer(
+    cardsetId: string,
+    awareness: Uint8Array,
+  ): Buffer {
+    // JSON 구조를 직접 문자열로 구성하여 중간 래퍼 객체 생성 최소화
+    const jsonStr = JSON.stringify({
+      data: {
+        cardsetId,
+        awareness: Array.from(awareness),
+      },
+    });
+    return Buffer.from(jsonStr, 'utf8');
+  }
+
+  /**
+   * awareness 이벤트 전송 (통일된 인터페이스)
+   * @param cardsetId 카드셋 ID
+   * @param awareness awareness 데이터
+   * @param client 선택적 클라이언트 (없으면 룸 전체에 브로드캐스트)
+   */
+  private sendAwareness(
+    cardsetId: string,
+    awareness: Uint8Array,
+    client?: Socket,
+  ): void {
+    const blob = this.createAwarenessBuffer(cardsetId, awareness);
+    if (client) {
+      client.emit('awareness', blob);
+    } else {
+      this.server.to(`cardset:${cardsetId}`).emit('awareness', blob);
+    }
+  }
+
+  /**
+   * 카드셋 룸에 awareness 이벤트 브로드캐스트 (최적화된 버전)
+   * @param cardsetId 카드셋 ID
+   * @param awareness awareness 데이터
+   */
+  private broadcastAwareness(cardsetId: string, awareness: Uint8Array): void {
+    this.sendAwareness(cardsetId, awareness);
+  }
+
+  /**
+   * DB에서 문서를 로드하거나 없으면 새로 생성
+   * DB에서 로드한 경우 Redis에 저장
+   */
+  private async loadDocumentFromDBOrCreate(
+    cardsetId: string,
+  ): Promise<Y.Doc | null> {
+    const numericCardsetId = Number(cardsetId);
+
+    if (Number.isNaN(numericCardsetId)) {
+      this.logger.error(
+        `Cannot load document from DB for cardset ${cardsetId}: invalid numeric id`,
+      );
+      return null;
+    }
+
+    try {
+      // DB에서 로드 시도
+      const doc =
+        await this.cardsetService.loadCardsetContentFromDB(numericCardsetId);
+      if (doc) {
+        // DB에서 로드한 문서를 Redis에 저장 (실패해도 계속 진행)
+        await this.yjsDocumentService
+          .saveDocument(cardsetId, doc)
+          .catch((error) => {
+            this.logger.warn(
+              `Failed to save document to Redis after DB load: ${error}`,
+            );
+          });
+        this.logger.log(
+          `Loaded Yjs document from DB and saved to Redis for cardset ${cardsetId}`,
+        );
+        return doc;
       }
+    } catch (error) {
+      this.logger.warn(
+        `Failed to load from DB for cardset ${cardsetId}, creating new document: ${error}`,
+      );
+    }
 
-      const doc = this.documentMap.get(documentId);
+    // DB에도 없거나 에러 발생 시 새로 생성
+    return this.createNewDocument(cardsetId);
+  }
 
-      if (!doc) {
+  /**
+   * 새 Yjs 문서를 생성하고 Redis에 저장
+   */
+  private async createNewDocument(cardsetId: string): Promise<Y.Doc> {
+    const doc = new Y.Doc();
+    this.logger.log(`Created new Yjs document for cardset ${cardsetId}`);
+    // Redis 저장 실패해도 문서는 반환 (메모리에서 사용 가능)
+    await this.yjsDocumentService
+      .saveDocument(cardsetId, doc)
+      .catch((error) => {
         this.logger.warn(
-          `Document not found: ${documentId} for client ${client.id}`,
+          `Failed to save new document to Redis: ${error}, continuing anyway`,
         );
-        client.emit('error', { message: 'Document not found' });
-        return;
-      }
+      });
+    return doc;
+  }
 
-      switch (type) {
-        case 'sync':
-          this.handleSyncMessage(client, doc, documentId, messageData);
-          break;
-        case 'update':
-          this.handleUpdateMessage(client, doc, documentId, messageData);
-          break;
-        case 'awareness':
-          this.handleAwarenessMessage(client, doc, documentId, messageData);
-          break;
-        default:
-          this.logger.warn(
-            `Unknown message type: ${type} from client ${client.id}`,
-          );
+  private async removeClientFromAllCardsets(client: Socket) {
+    const cardsets = await this.yjsDocumentService.getClientCardsets(client.id);
+    if (cardsets.length === 0) {
+      return;
+    }
+    for (const cardsetId of cardsets) {
+      void client.leave(`cardset:${cardsetId}`);
+      await this.yjsDocumentService.unregisterClient(cardsetId, client.id);
+      const activeCount =
+        await this.yjsDocumentService.getActiveClientCount(cardsetId);
+      if (activeCount === 0) {
+        this.scheduleFlush(cardsetId);
       }
-    } catch (error) {
-      this.logger.error(
-        `Error processing YJS message from client ${client.id}: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-      this.logger.error(`Raw data: ${JSON.stringify(data)}`);
     }
   }
 
-  private handleSyncMessage(
-    client: Socket,
-    doc: Y.Doc,
-    documentId: string,
-    data: any,
-  ) {
-    const { syncStep, update } = data as {
-      syncStep: number;
-      update?: number[];
-    };
+  private scheduleFlush(cardsetId: string) {
+    if (this.flushTimeouts.has(cardsetId)) {
+      return;
+    }
+    const timeout = setTimeout(() => {
+      this.flushTimeouts.delete(cardsetId);
+      void this.flushCardset(cardsetId);
+    }, CollaborationGateway.FLUSH_DELAY_MS);
+    this.flushTimeouts.set(cardsetId, timeout);
+    this.logger.log(`Scheduled cardset ${cardsetId} flush`);
+  }
 
-    if (syncStep === 0) {
-      // Step 0: 클라이언트가 현재 상태 벡터 전송
-      const stateVector = Y.encodeStateVector(doc);
-      client.emit('yjs-message', {
-        type: 'sync',
-        data: { syncStep: 1, update: Array.from(stateVector) },
-      });
-    } else if (syncStep === 1 && update) {
-      // Step 1: 서버가 차이점 전송
-      const diff = Y.encodeStateAsUpdate(
-        doc,
-        new Uint8Array(update as unknown as ArrayBufferLike),
-      );
-      client.emit('yjs-message', {
-        type: 'sync',
-        data: { syncStep: 1, update: Array.from(diff) },
-      });
+  private clearScheduledFlush(cardsetId: string) {
+    const timeout = this.flushTimeouts.get(cardsetId);
+    if (timeout) {
+      clearTimeout(timeout);
+      this.flushTimeouts.delete(cardsetId);
     }
   }
 
-  private handleUpdateMessage(
-    client: Socket,
-    doc: Y.Doc,
-    documentId: string,
-    data: any,
-  ) {
-    const { update } = data as { update: number[] };
-    Y.applyUpdate(doc, new Uint8Array(update as unknown as ArrayBufferLike));
-
-    // 다른 클라이언트들에게 업데이트 브로드캐스트
-    client.to(documentId).emit('yjs-message', {
-      type: 'update',
-      data: { update: Array.from(update) },
-    });
-  }
-
-  private handleAwarenessMessage(
-    client: Socket,
-    doc: Y.Doc,
-    documentId: string,
-    data: any,
-  ) {
-    const { awareness } = data as { awareness: number[] };
-
-    // 다른 클라이언트들에게 awareness 브로드캐스트
-    client.to(documentId).emit('yjs-message', {
-      type: 'awareness',
-      data: { awareness: Array.from(awareness) },
-    });
-  }
-
-  private handleAuth(
-    client: Socket,
-    data: { token: string; userId: string; documentId: string },
-  ) {
+  private async flushCardset(cardsetId: string) {
+    const activeCount =
+      await this.yjsDocumentService.getActiveClientCount(cardsetId);
+    if (activeCount > 0) {
+      return;
+    }
     try {
-      this.logger.log(
-        `Received auth from client ${client.id}, userId: ${data.userId}, documentId: ${data.documentId}`,
-      );
-      this.logger.log(`Auth data: ${JSON.stringify(data)}`);
-
-      // TODO: 실제 JWT 토큰 검증 로직 구현
-      // 임시로 토큰이 있으면 인증 성공으로 처리
-      const hasAccess = true;
-
-      const accessControlMessage = {
-        data: {
-          hasAccess,
-          message: hasAccess
-            ? 'Authentication successful'
-            : 'Authentication failed',
-        },
-        clientId: client.id,
-        timestamp: new Date().toISOString(),
-      };
-
-      this.logger.log(
-        `Sending access-control to client ${client.id}: ${JSON.stringify(accessControlMessage)}`,
-      );
-      client.emit('access-control', accessControlMessage);
-
-      // 클라이언트가 이벤트를 받을 시간을 주기 위해 약간의 지연
-      setTimeout(() => {
-        this.logger.log(`Auth result for client ${client.id}: ${hasAccess}`);
-      }, 100);
+      await this.cardsetService.saveCardsetContent(Number(cardsetId));
+      this.logger.log(`Flushed cardset ${cardsetId} snapshot to database`);
     } catch (error) {
-      this.logger.error(
-        `Auth error: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      );
-      this.logger.error(`Auth data: ${JSON.stringify(data)}`);
-      client.emit('access-control', {
-        data: {
-          hasAccess: false,
-          message: 'Authentication error',
-        },
-        clientId: client.id,
-        timestamp: new Date().toISOString(),
-      });
-    }
-  }
-
-  @SubscribeMessage('heartbeat')
-  handleHeartbeat(@ConnectedSocket() client: Socket) {
-    // 클라이언트로부터 heartbeat 응답 받음
-    this.logger.log(`Received heartbeat from client ${client.id}`);
-    client.emit('heartbeat-ack', {
-      clientId: client.id,
-      timestamp: new Date().toISOString(),
-    });
-  }
-
-  private startHeartbeat(client: Socket) {
-    const timer = setInterval(() => {
-      // 클라이언트가 연결되어 있는지 확인
-      if (!client.connected) {
-        this.logger.warn(
-          `Client ${client.id} is not connected, stopping heartbeat`,
-        );
-        this.stopHeartbeat(client.id);
-        return;
-      }
-
-      // 클라이언트에게 heartbeat 전송
-      client.emit('heartbeat', {
-        timestamp: new Date().toISOString(),
-      });
-    }, this.heartbeatInterval);
-
-    this.heartbeatTimers.set(client.id, timer);
-  }
-
-  private stopHeartbeat(clientId: string) {
-    const timer = this.heartbeatTimers.get(clientId);
-    if (timer) {
-      clearInterval(timer);
-      this.heartbeatTimers.delete(clientId);
+      this.logger.error(`Failed to flush cardset ${cardsetId}:`, error);
     }
   }
 }
